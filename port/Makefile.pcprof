@@ -1,0 +1,6 @@
+# Build PC instrumented (profile / guest call counter) :
+#   mingw32-make -f Makefile.pcprof OUT=../build/pc_prof -j16 SHELL=sh
+include Makefile.pc
+$(OUT)/gen/%.o: CFLAGS += -finstrument-functions -finstrument-functions-exclude-file-list=rt.h
+$(OUT)/src/rt/calltrace.o: CFLAGS += -DSH4_PROFILE=1
+$(OUT)/src/rt/x86rt.o: CFLAGS += -DSH4_PROFILE=1

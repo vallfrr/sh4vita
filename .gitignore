@@ -1,0 +1,29 @@
+# Game files: never in the repository
+game/
+*.bin
+*.exe
+*.dll
+*.afs
+*.bik
+
+# C code generated from the game binary (derived work, never versioned)
+port/gen/
+
+# Ghidra project and analysis output
+re/ghidra/*
+!re/ghidra/ExportFunctions.java
+re/out/
+
+# Local tools
+.venv/
+tools/sh4prep/target/
+__pycache__/
+
+# Builds
+build/
+*.vpk
+*.velf
+*.self
+eboot.bin
+build/difftest/
+

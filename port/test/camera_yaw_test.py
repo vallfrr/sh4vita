@@ -1,0 +1,7 @@
+from pathlib import Path
+import subprocess,tempfile
+root=Path(__file__).resolve().parents[2];s=(root/'port/src/rt/natives.c').read_text(encoding='utf8');a=s.index('void nat_camera_probe(CPU *c) {');fn=s[a:s.index('\n}',a)+2]
+head='''#include "rt.h"\n#include <assert.h>\n#include <stdlib.h>\nuint8_t*g_mem;char g_game_dir[512];unsigned g_frame=100,g_camera_pad_frame=100;int g_camera_pad_x,g_camera_pad_y,g_camera_pad_active; static float factor=2,seen;\nfloat rt_camera_scale(void){return factor;}\nint rt_window_camera_active(void){return 0;}\nvoid rt_log(const char*fmt,...){(void)fmt;}\nvoid F_0052d710_orig(CPU*c){uint8_t*mb=g_mem;unsigned p=R32(c->esp+4);seen=rt_f32(R32(p+8));c->esp+=4;}\n'''
+test='''\nint main(void){g_mem=calloc(1,32u<<20);uint8_t*mb=g_mem;CPU c={0};assert(mb);W32(0x2004,0x3000);W32(0x3008,rt_u32f(1.f));W32(0xfd5ba4,0);g_camera_pad_active=1;g_camera_pad_x=30000;c.esp=0x2000;nat_camera_probe(&c);assert(seen==2.f && rt_f32(R32(0x3008))==1.f);g_camera_pad_x=-30000;c.esp=0x2000;nat_camera_probe(&c);assert(seen==1.f);g_camera_pad_x=30000;g_camera_pad_active=0;c.esp=0x2000;nat_camera_probe(&c);assert(seen==1.f);puts("first-person yaw scale, argument restoration and non-pad guard OK");free(g_mem);return 0;}\n'''
+with tempfile.TemporaryDirectory(prefix='sh4-yaw-') as d:
+ c=Path(d)/'test.c';exe=Path(d)/'test.exe';c.write_text(head+fn+test,encoding='utf8');subprocess.run(['gcc','-std=gnu11','-O2','-I'+str(root/'port/src/rt'),str(c),'-lm','-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)

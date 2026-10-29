@@ -1,0 +1,33 @@
+# Build PC (MinGW-w64 + SDL2) to test the port. Run from port/ :
+#   mingw32-make -f Makefile.pc -j16
+.DEFAULT_GOAL := all
+CC      = gcc
+SDL     = ../../tools/sdl2/SDL2-2.32.10/x86_64-w64-mingw32
+CFLAGS  = -std=gnu11 -O2 -g -Isrc/rt -Isrc -Igen -I$(SDL)/include -I$(SDL)/include/SDL2 \
+          -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -MMD -MP
+LDFLAGS = -Wl,--disable-dynamicbase -L$(SDL)/lib -lmingw32 -lSDL2main -lSDL2 -lopengl32 -lm
+OUT     = ../build/pc
+
+GEN_SRC = $(wildcard gen/*.c)
+RT_SRC  = $(wildcard src/rt/*.c src/win32/*.c src/d3d8/*.c src/dx/*.c src/pc/*.c) src/third_party/tlsf/tlsf.c
+OBJ     = $(patsubst %.c,$(OUT)/%.o,$(GEN_SRC) $(RT_SRC))
+
+# Resource/shader layout changes must rebuild every consumer of the header.
+-include $(OBJ:.o=.d)
+
+all: $(OUT)/sh4.exe
+
+$(OUT)/sh4.exe: $(OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+	cp $(SDL)/bin/SDL2.dll $(OUT)/
+
+$(OUT)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+gen-check: $(patsubst %.c,$(OUT)/%.o,$(GEN_SRC))
+
+clean:
+	rm -rf $(OUT)
+
+.PHONY: all gen-check clean

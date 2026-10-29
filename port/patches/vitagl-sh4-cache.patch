@@ -1,0 +1,745 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index e5b3d82..27b5d64 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -610,14 +610,159 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
+ }
+ 
+ #ifdef HAVE_SHADER_CACHE
++// Cache exact translated Cg and compiler settings. Both stages are translated
++// before lookup, retaining the current pair's complete semantic maps.
++extern void rt_log(const char *, ...) __attribute__((weak));
++typedef struct { uint32_t magic, bytes; uint64_t key, checksum; } sh4_cg_header;
++static uint32_t sh4_cg_write_failures;
++static void (*sh4_cg_observer)(const char *);
++void sh4_cg_cache_observe(void (*observer)(const char *)) { sh4_cg_observer = observer; }
++uint64_t sh4_cg_cache_config(void) {
++    uint32_t options[] = {0x000a0001u, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint,
++#ifdef HAVE_GLSL_TEXTURE_SIZE
++        1
++#else
++        0
++#endif
++    };
++    return XXH3_64bits(options, sizeof(options));
++}
++uint32_t sh4_cg_cache_revision(void) { return 0x000a0001u; }
++uint32_t sh4_cg_cache_failures(void) { return sh4_cg_write_failures; }
++static void sh4_cache_parent(const char *name) {
++    char parent[256];
++    int length = snprintf(parent, sizeof(parent), "%s", name);
++    if (length < 0 || (size_t)length >= sizeof(parent)) return;
++    // Also repair missing v/f roots or an entirely removed cache tree.
++    for (char *slash = strchr(parent, '/'); slash; slash = strchr(slash + 1, '/')) {
++        if (slash == parent || slash[-1] == ':') continue;
++        *slash = 0; sceIoMkdir(parent, 0777); *slash = '/';
++    }
++}
++static void sh4_cg_name(shader *s, char *name) {
++    uint32_t options[] = {0x000a0001u, s->type, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint,
++#ifdef HAVE_GLSL_TEXTURE_SIZE
++        1
++#else
++        0
++#endif
++    };
++    uint64_t hash = XXH3_64bits(s->source, s->size);
++    uint64_t source_hash = hash;
++    uint64_t map_hash = XXH3_64bits(&s->semantics, sizeof(s->semantics));
++    hash = XXH3_64bits_withSeed(options, sizeof(options), hash);
++    sprintf(name, "%s/%c/%02X/cg2-%016llx.gxp", vgl_shader_cache_path,
++        s->type == GL_VERTEX_SHADER ? 'v' : 'f', (unsigned)(hash >> 56), (unsigned long long)hash);
++    if (rt_log) rt_log("[cg-key] stage=%s source=%016llx map=%016llx key=%016llx\n", s->type == GL_VERTEX_SHADER ? "vs" : "fs",
++        (unsigned long long)source_hash, (unsigned long long)map_hash, (unsigned long long)hash);
++    if (getenv("SH4_CG_DUMP")) {
++        char dump[320]; snprintf(dump, sizeof(dump), "%s.cg", name);
++        SceUID f = sceIoOpen(dump, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++        if (f >= 0) { sceIoWrite(f, s->source, s->size); sceIoClose(f); }
++    }
++}
++static uint64_t sh4_cg_key(const char *name) { return strtoull(strrchr(name, '/') + 5, NULL, 16); }
++static GLboolean sh4_cg_payload_ok(const uint8_t *p, size_t n) {
++    if (n < 4) return GL_FALSE;
++    uint32_t matrices;
++    memcpy(&matrices, p, 4);
++    if (matrices > (n - 4) / 4) return GL_FALSE;
++    size_t off = 4 + (size_t)matrices * 4;
++#ifdef HAVE_GLSL_TEXTURE_SIZE
++    if (off >= n) return GL_FALSE;
++    unsigned samplers = p[off++];
++    if (samplers > SCE_GXM_MAX_TEXTURE_UNITS || samplers > (n - off) / sizeof(glsl_samplers_info)) return GL_FALSE;
++    off += samplers * sizeof(glsl_samplers_info);
++#endif
++    return n - off >= 32;
++}
++static GLboolean sh4_cg_read_file(const char *name, sh4_cg_header *out_header, uint8_t **out_data) {
++    SceUID f = sceIoOpen(name, SCE_O_RDONLY, 0777);
++    if (f < 0) return GL_FALSE;
++    SceOff length = sceIoLseek(f, 0, SCE_SEEK_END);
++    sceIoLseek(f, 0, SCE_SEEK_SET);
++    sh4_cg_header header;
++    GLboolean ok = length > sizeof(header) && length < 1024 * 1024 &&
++        sceIoRead(f, &header, sizeof(header)) == sizeof(header);
++    ok = ok && header.magic == 0x32434753u && header.bytes == length - sizeof(header) && header.key == sh4_cg_key(name);
++    uint8_t *data = ok ? vglMalloc(header.bytes) : NULL;
++    ok = data && sceIoRead(f, data, header.bytes) == header.bytes;
++    sceIoClose(f);
++    ok = ok && XXH3_64bits(data, header.bytes) == header.checksum && sh4_cg_payload_ok(data, header.bytes);
++    if (!ok) { vgl_free(data); return GL_FALSE; }
++    *out_header = header; *out_data = data;
++    return GL_TRUE;
++}
++extern const char *sh4_shader_bundle_stage_root(void) __attribute__((weak));
++static GLboolean sh4_cg_read(const char *name, sh4_cg_header *out_header, uint8_t **out_data) {
++    const char *enabled = getenv("SH4_BUNDLED_CACHE");
++    size_t prefix = strlen(vgl_shader_cache_path);
++    if (sh4_shader_bundle_stage_root && (!enabled || strcmp(enabled, "0")) &&
++        !strncmp(name, vgl_shader_cache_path, prefix) && name[prefix] == '/') {
++        char bundled[512];
++        int n = snprintf(bundled, sizeof(bundled), "%s/%s", sh4_shader_bundle_stage_root(), name + prefix + 1);
++        if (n > 0 && n < sizeof(bundled) && sh4_cg_read_file(bundled, out_header, out_data)) {
++            if (rt_log) rt_log("[cg-cache] hit bundle stage=%c\n", name[prefix + 1]);
++            return GL_TRUE;
++        }
++    }
++    return sh4_cg_read_file(name, out_header, out_data);
++}
++int sh4_cg_cache_validate(const char *name) {
++    size_t prefix = strlen(vgl_shader_cache_path);
++    if (strncmp(name, vgl_shader_cache_path, prefix) || name[prefix] != '/') return 0;
++    const char *base = strrchr(name, '/');
++    if (!base || strlen(++base) != 24 || strncmp(base, "cg2-", 4) || strcmp(base + 20, ".gxp")) return 0;
++    for (unsigned i = 4; i < 20; i++) if (!((base[i] >= '0' && base[i] <= '9') || (base[i] >= 'a' && base[i] <= 'f'))) return 0;
++    sh4_cg_header header; uint8_t *data;
++    if (!sh4_cg_read(name, &header, &data)) return 0;
++    vgl_free(data);
++    return 1;
++}
++static GLboolean sh4_cg_load(shader *s, const char *name) {
++    sh4_cg_header header; uint8_t *data;
++    if (!sh4_cg_read(name, &header, &data)) return GL_FALSE;
++    // Keep the current pair's semantic map; the cached stage has exactly this Cg input.
++    unserialize_shader(data, header.bytes, s, GL_FALSE);
++    vgl_free(s->source);
++    s->source = NULL;
++    if (rt_log) rt_log("[cg-cache] hit stage=%s bytes=%u\n", s->type == GL_VERTEX_SHADER ? "vs" : "fs", header.bytes);
++    if (sh4_cg_observer) sh4_cg_observer(name);
++    vgl_free(data);
++    return GL_TRUE;
++}
++static void sh4_cg_save(shader *s, const char *name, const void *data, size_t bytes) {
++    sh4_cg_header header = {0x32434753u, bytes, sh4_cg_key(name), XXH3_64bits(data, bytes)};
++    // Repair a partially initialized cache lazily. An existing v/00 must not
++    // prevent fragment buckets (or other missing vertex buckets) being made.
++    sh4_cache_parent(name);
++    SceUID f = sceIoOpen(name, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++    GLboolean ok = f >= 0;
++    if (ok) {
++        ok = sceIoWrite(f, &header, sizeof(header)) == sizeof(header);
++        if (ok) ok = sceIoWrite(f, data, bytes) == bytes;
++        if (sceIoClose(f) < 0) ok = GL_FALSE;
++    }
++    if (ok && sh4_cg_observer) sh4_cg_observer(name);
++    if (!ok) {
++        sh4_cg_write_failures++;
++        if (rt_log) rt_log("[cg-cache] write failure %08x file=%s\n", (unsigned)f, name);
++    }
++    if (rt_log) rt_log("[cg-cache] compile stage=%s bytes=%u\n", s->type == GL_VERTEX_SHADER ? "vs" : "fs", (unsigned)bytes);
++}
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname)
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
+ #else
+ #define vgl_compile_shader(shd, sv) compile_shader(shd, sv)
+ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
+ #endif
++    extern void sh4_shader_alloc_trace(const char *);
++    extern void sh4_before_source_compile(const char *);
++    sh4_before_source_compile(s->type == GL_VERTEX_SHADER ? "vs" : "fs");
++    sh4_shader_alloc_trace("before-compile");
+ 	// Compiling shader source
+ 	s->prog = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
++    sh4_shader_alloc_trace("after-compile");
+ 	if (s->prog) {
+ 		vgl_free(s->source);
+ 		s->source = NULL;
+@@ -656,13 +801,21 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 	shark_log = NULL;
+ #endif
+ 	shark_clear_output();
++    sh4_shader_alloc_trace("after-clear-output");
+ #ifdef HAVE_SHADER_CACHE
+-	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+-	size_t sz;
+-	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-	sceIoWrite(f, buf, sz);
+-	sceIoClose(f);
+-	vgl_free(buf);
++    if (s->prog) {
++        size_t sz;
++        const char *base = strrchr(cache_fname, '/');
++        GLboolean cg = save_bindings && base && !strncmp(base + 1, "cg2-", 4);
++        void *buf = serialize_shader(NULL, &sz, s, cg ? GL_FALSE : save_bindings);
++        if (cg) { if (!s->unif_blk) sh4_cg_save(s, cache_fname, buf, sz); }
++        else {
++            sh4_cache_parent(cache_fname);
++            SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++            if (f >= 0) { sceIoWrite(f, buf, sz); sceIoClose(f); }
++        }
++        vgl_free(buf);
++    }
+ #endif
+ }
+ 
+@@ -1974,6 +2127,8 @@ void glProgramBinary(GLuint prog, GLenum binaryFormat, const void *binary, GLsiz
+ 
+ void glDeleteProgram(GLuint prog) {
+ 	THREAD_SAFE()
++    extern void sh4_shader_alloc_trace(const char *);
++    sh4_shader_alloc_trace("before-delete-program");
+ 
+ 	// Grabbing passed program
+ 	program *p = &progs[prog - 1];
+@@ -2022,6 +2177,7 @@ void glDeleteProgram(GLuint prog) {
+ 		}
+ 	}
+ 	p->status = PROG_INVALID;
++    sh4_shader_alloc_trace("after-delete-program");
+ }
+ 
+ void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei *length, GLchar *infoLog) {
+@@ -2123,43 +2279,17 @@ void glLinkProgram(GLuint progr) {
+ 	if (glsl_sema_mode == VGL_MODE_POSTPONED && (p->vshader->is_glsl || p->fshader->is_glsl)) {
+ 		glsl_sema_mode = VGL_MODE_SHADER_PAIR;
+ #ifdef HAVE_SHADER_CACHE
+-		char frag_fname[256], vert_fname[256];
+-		char *fname;
+-		if (!p->vshader->prog) {
+-			uint64_t hash = XXH3_64bits(p->vshader->source, p->vshader->size);
+-			uint8_t subdir_hash = hash >> 56;
+-			sprintf(vert_fname, "%s/v/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
+-			if (f >= 0) {
+-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+-				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
+-				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
+-				vgl_free(buf);
+-			}
+-		}
+-		if (!p->fshader->prog) {
+-			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
+-			uint8_t subdir_hash = hash >> 56;
+-			sprintf(frag_fname, "%s/f/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
+-			if (f >= 0) {
+-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+-				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
+-				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
+-				vgl_free(buf);
+-			}
+-		}
++        char frag_fname[256], vert_fname[256];
++        char *fname;
+ #endif
+ 		if (!p->vshader->prog || !p->fshader->prog) {
+ 			if (p->vshader->is_glsl || p->fshader->is_glsl) {
+ 				glsl_translator_set_process(p->vshader, p->fshader);
+ 			}
++#ifdef HAVE_SHADER_CACHE
++            if (!p->vshader->prog) { sh4_cg_name(p->vshader, vert_fname); sh4_cg_load(p->vshader, vert_fname); }
++            if (!p->fshader->prog) { sh4_cg_name(p->fshader, frag_fname); sh4_cg_load(p->fshader, frag_fname); }
++#endif
+ 			if (!p->vshader->prog) {
+ #ifdef HAVE_SHADER_CACHE
+ 				fname = vert_fname;
+@@ -2404,6 +2534,8 @@ void glLinkProgram(GLuint progr) {
+ 			}
+ 		}
+ 	}
++    extern void sh4_finish_compiler_scope(void);
++    sh4_finish_compiler_scope();
+ }
+ 
+ void glUseProgram(GLuint prog) {
+diff --git a/source/ffp.c b/source/ffp.c
+index 11937c4..4da2626 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -834,7 +834,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 			char vshader[8192];
+ 			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, WVP_ON_GPU, mask.fast_perspective_correction);
+ 			uint32_t size = strlen(vshader);
+-			SceGxmProgram *t = shark_compile_shader_extended(vshader, &size, SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
++			extern void sh4_before_source_compile(const char *);
++            sh4_before_source_compile("ffp-vs");
++            SceGxmProgram *t = shark_compile_shader_extended(vshader, &size, SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+ 			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
+ 			vgl_fast_memcpy((void *)ffp_vertex_program, (void *)t, size);
+ 			shark_clear_output();
+@@ -1122,7 +1124,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 				mask.lights_num, mask.lighting, mask.shading_mode, mask.point_sprite, mask.fast_perspective_correction, mask.srgb_mode);
+ #endif
+ 			uint32_t size = strlen(fshader);
+-			SceGxmProgram *t = shark_compile_shader_extended(fshader, &size, SHARK_FRAGMENT_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
++			extern void sh4_before_source_compile(const char *);
++            sh4_before_source_compile("ffp-fs");
++            SceGxmProgram *t = shark_compile_shader_extended(fshader, &size, SHARK_FRAGMENT_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+ 			ffp_fragment_program = (SceGxmProgram *)vglMalloc(size);
+ 			vgl_fast_memcpy((void *)ffp_fragment_program, (void *)t, size);
+ 			shark_clear_output();
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 15e59ea..d822942 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -198,6 +198,40 @@ GLboolean _glReadPixels_gpu(GLint x, GLint y, GLsizei width, GLsizei height, GLe
+  * ------------------------------
+  */
+ 
++static void release_renderbuffer(renderbuffer *rb) {
++	if (!rb || !rb->deleted || rb->references) return;
++#ifndef DEPTH_STENCIL_HACK
++	if (rb->depth_ready) {
++		if (rb->depthbuffer.depthData) mark_as_dirty(rb->depthbuffer.depthData);
++		if (rb->depthbuffer.stencilData) mark_as_dirty(rb->depthbuffer.stencilData);
++	}
++#endif
++	rb->depth_ready = GL_FALSE;
++	rb->active = GL_FALSE;
++}
++static void attach_renderbuffer(framebuffer *fb, renderbuffer *rb) {
++	if (fb->depth_rb == rb) return;
++	_vglDiscardPrivateDepth(fb);
++	renderbuffer *old = fb->depth_rb;
++	fb->depth_rb = rb;
++	if (rb) rb->references++;
++	if (old) { old->references--; release_renderbuffer(old); }
++	fb->depthbuffer_state = rb && rb->wants_stencil ? DEPTHBUFFER_WANTS_STENCIL : DEPTHBUFFER_MISSING;
++}
++static void renderbuffer_storage(renderbuffer *rb, GLenum format, GLsizei width, GLsizei height) {
++	for (int i = 0; i < BUFFERS_NUM; i++)
++		if (framebuffers[i].active && framebuffers[i].depth_rb == rb) _vglDiscardPrivateDepth(&framebuffers[i]);
++#ifndef DEPTH_STENCIL_HACK
++	if (rb->depth_ready) {
++		if (rb->depthbuffer.depthData) mark_as_dirty(rb->depthbuffer.depthData);
++		if (rb->depthbuffer.stencilData) mark_as_dirty(rb->depthbuffer.stencilData);
++	}
++#endif
++	rb->depth_ready = GL_FALSE;
++	rb->width = width; rb->height = height;
++	rb->wants_stencil = format == GL_STENCIL_INDEX8 || format == GL_DEPTH24_STENCIL8 || format == GL_DEPTH32F_STENCIL8;
++}
++
+ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *ids) {
+ 	THREAD_SAFE()
+ 
+@@ -215,6 +249,7 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+ 			framebuffers[i].active = GL_TRUE;
+ 			framebuffers[i].depthbuffer_state = DEPTHBUFFER_MISSING;
+ 			framebuffers[i].depthbuffer_ptr = NULL;
++			framebuffers[i].depth_rb = NULL;
+ 			framebuffers[i].target = NULL;
+ 			framebuffers[i].tex = NULL;
+ 		}
+@@ -241,6 +276,7 @@ void glGenRenderbuffers(GLsizei n, GLuint *ids) {
+ 	for (i = 0; i < BUFFERS_NUM; i++) {
+ 		if (!renderbuffers[i].active) {
+ 			ids[j++] = (GLuint)&renderbuffers[i];
++			memset(&renderbuffers[i], 0, sizeof(renderbuffers[i]));
+ 			renderbuffers[i].active = GL_TRUE;
+ 			renderbuffers[i].wants_stencil = GL_FALSE;
+ 		}
+@@ -279,11 +315,8 @@ void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+ 			if (fb->target) {
+ 				mark_rt_as_dirty(fb->target);
+ 			}
+-#ifndef DEPTH_STENCIL_HACK
+-			if (fb->depthbuffer_ptr) {
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
+-			}
+-#endif
++			_vglDiscardPrivateDepth(fb);
++			attach_renderbuffer(fb, NULL);
+ 		}
+ 	}
+ }
+@@ -299,7 +332,9 @@ void glDeleteRenderbuffers(GLsizei n, const GLuint *ids) {
+ 	while (n > 0) {
+ 		renderbuffer *rb = (renderbuffer *)ids[--n];
+ 		if (rb) {
+-			rb->active = GL_FALSE;
++			rb->deleted = GL_TRUE;
++			if (active_rb == rb) active_rb = NULL;
++			release_renderbuffer(rb);
+ 		}
+ 	}
+ }
+@@ -362,19 +397,11 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
+ 	}
+ #endif
+ 
+-	// Discarding any previously bound hidden depth buffers
+-	if (fb->depthbuffer_ptr) {
+-#ifndef DEPTH_STENCIL_HACK
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
+-#endif
+-	}
+-	fb->depthbuffer_ptr = NULL;
+-
+ 	switch (attachment) {
+ 	case GL_DEPTH_STENCIL_ATTACHMENT:
+ 	case GL_DEPTH_ATTACHMENT:
+ 	case GL_STENCIL_ATTACHMENT:
+-		fb->depthbuffer_state = (rb && ((renderbuffer *)rb)->wants_stencil) ? DEPTHBUFFER_WANTS_STENCIL : DEPTHBUFFER_MISSING;
++		attach_renderbuffer(fb, (renderbuffer *)rb);
+ 		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, attachment)
+@@ -394,19 +421,11 @@ void glNamedFramebufferRenderbuffer(GLuint target, GLenum attachment, GLenum ren
+ 
+ 	framebuffer *fb = (framebuffer *)target;
+ 
+-	// Discarding any previously bound hidden depth buffers
+-	if (fb->depthbuffer_ptr) {
+-#ifndef DEPTH_STENCIL_HACK
+-		mark_as_dirty(fb->depthbuffer_ptr->depthData);
+-#endif
+-		fb->depthbuffer_ptr = NULL;
+-	}
+-
+ 	switch (attachment) {
+ 	case GL_DEPTH_STENCIL_ATTACHMENT:
+ 	case GL_DEPTH_ATTACHMENT:
+ 	case GL_STENCIL_ATTACHMENT:
+-		fb->depthbuffer_state = (rb && ((renderbuffer *)rb)->wants_stencil) ? DEPTHBUFFER_WANTS_STENCIL : DEPTHBUFFER_MISSING;
++		attach_renderbuffer(fb, (renderbuffer *)rb);
+ 		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, attachment)
+@@ -429,8 +448,6 @@ void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width,
+ 	case GL_STENCIL_INDEX8:
+ 	case GL_DEPTH24_STENCIL8:
+ 	case GL_DEPTH32F_STENCIL8:
+-		active_rb->wants_stencil = GL_TRUE;
+-		break;
+ 	case GL_DEPTH_COMPONENT:
+ 	case GL_DEPTH_COMPONENT16:
+ 	case GL_DEPTH_COMPONENT24:
+@@ -440,6 +457,7 @@ void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width,
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, internalformat)
+ 	}
++	renderbuffer_storage(active_rb, internalformat, width, height);
+ }
+ 
+ void glNamedRenderbufferStorage(GLuint target, GLenum internalformat, GLsizei width, GLsizei height) {
+@@ -449,8 +467,6 @@ void glNamedRenderbufferStorage(GLuint target, GLenum internalformat, GLsizei wi
+ 	switch (internalformat) {
+ 	case GL_DEPTH24_STENCIL8:
+ 	case GL_DEPTH32F_STENCIL8:
+-		rb->wants_stencil = GL_TRUE;
+-		break;
+ 	case GL_DEPTH_COMPONENT:
+ 	case GL_DEPTH_COMPONENT16:
+ 	case GL_DEPTH_COMPONENT24:
+@@ -460,6 +476,7 @@ void glNamedRenderbufferStorage(GLuint target, GLenum internalformat, GLsizei wi
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, internalformat)
+ 	}
++	renderbuffer_storage(rb, internalformat, width, height);
+ }
+ 
+ inline void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint tex_id, GLint level) {
+@@ -963,7 +980,7 @@ GLboolean glIsFramebuffer(GLuint fb) {
+ 
+ GLboolean glIsRenderbuffer(GLuint rb) {
+ 	renderbuffer *p = (renderbuffer *)rb;
+-	return (p && p->active);
++	return (p && p->active && !p->deleted);
+ }
+ 
+ void glReadBuffer(GLenum mode) {
+diff --git a/source/gxm.c b/source/gxm.c
+index 7bcce62..344f9e4 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -23,6 +23,9 @@
+ 
+ #include "shared.h"
+ 
++static int last_scene_error;
++int vglGetLastSceneError(void) { int error = last_scene_error; last_scene_error = 0; return error; }
++
+ #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
+ 
+ // FIXME: Since we use our own default uniform buffers circular pool, fragment and vertex buffer rings can likely be reduced in size
+@@ -304,8 +307,92 @@ int garbage_collector(unsigned int args, void *arg) {
+ #endif
+ }
+ 
++// Opt-in allocation diagnosis for cold shader preparation. No GPU allocations
++// are owned by these counters: only allocations made through the compiler API.
++#include <malloc.h>
++extern void rt_log(const char *, ...) __attribute__((weak));
++void sh4_before_source_compile(const char *stage) {
++    extern void rt_fatal(const char *, ...) __attribute__((weak));
++    const char *cache_only = getenv("SH4_SHADER_CACHE_ONLY");
++    if (cache_only && !strcmp(cache_only, "1")) {
++        if (rt_fatal) rt_fatal("[shader-cache-miss] source compilation required stage=%s", stage);
++        abort();
++    }
++    if (rt_log) rt_log("[shader-source] compiling stage=%s\n", stage);
++}
++static uint32_t sh4_alloc_bytes, sh4_free_bytes, sh4_alloc_count, sh4_free_count;
++static GLboolean sh4_alloc_trace_enabled;
++typedef struct __attribute__((aligned(16))) sh4_compiler_block {
++    struct sh4_compiler_block *prev, *next;
++    uint32_t bytes, magic;
++} sh4_compiler_block;
++static sh4_compiler_block *sh4_compiler_head;
++static volatile int sh4_compiler_lock;
++static void sh4_compiler_enter(void) { while (__sync_lock_test_and_set(&sh4_compiler_lock, 1)) sceKernelDelayThread(0); }
++static void sh4_compiler_leave(void) { __sync_lock_release(&sh4_compiler_lock); }
++static void *sh4_compiler_alloc(size_t bytes) {
++    if (bytes > UINT32_MAX - sizeof(sh4_compiler_block)) return NULL;
++    sh4_compiler_block *p = vglMemalign(16, sizeof(*p) + bytes);
++    if (!p) return NULL;
++    p->bytes = vglMallocUsableSize(p); p->magic = 0x53484341u;
++    sh4_compiler_enter();
++    p->prev = NULL; p->next = sh4_compiler_head;
++    if (p->next) p->next->prev = p;
++    sh4_compiler_head = p;
++    sh4_alloc_bytes += p->bytes; sh4_alloc_count++;
++    sh4_compiler_leave();
++    return p + 1;
++}
++static void sh4_compiler_free(void *pointer) {
++    if (!pointer) return;
++    sh4_compiler_block *p = (sh4_compiler_block *)pointer - 1;
++    if (p->magic != 0x53484341u) {
++        if (rt_log) rt_log("[compiler-arena] invalid allocation in compiler free\n");
++        return;
++    }
++    sh4_compiler_enter();
++    if (p->prev) p->prev->next = p->next; else sh4_compiler_head = p->next;
++    if (p->next) p->next->prev = p->prev;
++    sh4_free_bytes += p->bytes; sh4_free_count++;
++    p->magic = 0;
++    sh4_compiler_leave();
++    vglFree(p);
++}
++// Called only after shark_end has released the compiler and unloaded its module.
++// GXP programs and reflected uniform metadata were copied into ordinary vitaGL
++// allocations before that point; they are not members of this allocation list.
++static void sh4_compiler_purge(void) {
++    sh4_compiler_enter();
++    sh4_compiler_block *p = sh4_compiler_head;
++    sh4_compiler_head = NULL;
++    sh4_compiler_leave();
++    uint32_t bytes = 0, count = 0;
++    while (p) {
++        sh4_compiler_block *next = p->next;
++        bytes += p->bytes; count++; p->magic = 0;
++        vglFree(p); p = next;
++    }
++    sh4_free_bytes += bytes; sh4_free_count += count;
++    if (count && rt_log) rt_log("[compiler-arena] reclaimed %u bytes in %u blocks after compiler shutdown\n", bytes, count);
++}
++void sh4_finish_compiler_scope(void) {
++    // Bound retained compiler scratch memory without reloading the module for
++    // every tiny shader. A completed preparation explicitly releases the tail.
++    if (sh4_compiler_head && sh4_alloc_bytes - sh4_free_bytes >= 1024 * 1024) glReleaseShaderCompiler();
++}
++void sh4_shader_alloc_trace(const char *phase) {
++    static unsigned emitted;
++    if (!sh4_alloc_trace_enabled || !rt_log) return;
++    unsigned sample = emitted++;
++    if (sample >= 80 && sample % 100 >= 6 && strncmp(phase, "release", 7)) return;
++    struct mallinfo m = mallinfo();
++    rt_log("[compiler-alloc] phase=%s live=%u objects=%u host=%u alloc=%u free=%u\n", phase,
++        sh4_alloc_bytes - sh4_free_bytes, sh4_alloc_count - sh4_free_count, (unsigned)m.uordblks,
++        sh4_alloc_count, sh4_free_count);
++}
+ GLboolean start_shader_compiler(void) {
+-	shark_set_allocators(vglMalloc, vglFree);
++    sh4_alloc_trace_enabled = getenv("SH4_SHADER_ALLOC_TRACE") != NULL;
++    shark_set_allocators(sh4_compiler_alloc, sh4_compiler_free);
+ 	is_shark_online = shark_init(NULL) >= 0;
+ 
+ 	// If standard path failed to init we try to init it with ScePiglet path
+@@ -621,6 +708,7 @@ void scene_reset(void) {
+ 				gxm_sync_objects[gxm_back_buffer_index],
+ 				&gxm_color_surfaces[gxm_back_buffer_index],
+ 				&gxm_depth_stencil_surface);
++			if (r) last_scene_error = r;
+ #ifdef LOG_ERRORS
+ 			if (r) {
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on display.\n", __FILE__, __LINE__, get_gxm_error_literal(r));
+@@ -634,8 +722,18 @@ void scene_reset(void) {
+ 			
+ 			// If the depthbuffer is dirty, we re-gen it
+ 			if (!(active_write_fb->depthbuffer_state & DEPTHBUFFER_READY)) {
+-				init_depth_stencil_buffer(active_write_fb->width, active_write_fb->height, &active_write_fb->depthbuffer, active_write_fb->depthbuffer_state == DEPTHBUFFER_WANTS_STENCIL);
+-				active_write_fb->depthbuffer_ptr = &active_write_fb->depthbuffer;
++				renderbuffer *rb = active_write_fb->depth_rb;
++				if (rb && rb->width >= active_write_fb->width && rb->height >= active_write_fb->height) {
++					if (!rb->depth_ready) {
++						init_depth_stencil_buffer(rb->width, rb->height, &rb->depthbuffer, rb->wants_stencil);
++						rb->depth_ready = GL_TRUE;
++					}
++					active_write_fb->depthbuffer_ptr = &rb->depthbuffer;
++				} else {
++					// Keep a private surface for unattached or undersized RBOs (legacy compatibility).
++					init_depth_stencil_buffer(active_write_fb->width, active_write_fb->height, &active_write_fb->depthbuffer, rb ? rb->wants_stencil : active_write_fb->depthbuffer_state == DEPTHBUFFER_WANTS_STENCIL);
++					active_write_fb->depthbuffer_ptr = &active_write_fb->depthbuffer;
++				}
+ 				active_write_fb->depthbuffer_state |= DEPTHBUFFER_READY;
+ 			}
+ 
+@@ -673,6 +771,7 @@ void scene_reset(void) {
+ 					NULL, NULL, NULL,
+ 					&active_write_fb->colorbuffer,
+ 					active_write_fb->depthbuffer_ptr);
++			if (r) last_scene_error = r;
+ #ifdef LOG_ERRORS
+ 			if (r)
+ 				vgl_log("%s:%d Scene reset failed due to sceGxmBeginScene erroring (%s) on framebuffer 0x%08X.\n", __FILE__, __LINE__, get_gxm_error_literal(r), active_write_fb);
+@@ -978,11 +1077,14 @@ void glFinish(void) {
+ 
+ void glReleaseShaderCompiler(void) {
+ 	THREAD_SAFE()
++    sh4_shader_alloc_trace("release-begin");
+ 
+ 	if (is_shark_online) {
+ 		shark_end();
+ 		is_shark_online = GL_FALSE;
+ 	}
++    sh4_compiler_purge();
++    sh4_shader_alloc_trace("release-end");
+ }
+ 
+ void glFlush(void) {
+diff --git a/source/shared.h b/source/shared.h
+index 6954fa3..e0bd71b 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -591,6 +591,14 @@ enum {
+ 	DEPTHBUFFER_READY
+ };
+ 
++// Renderbuffers own their depth/stencil storage; attachments may share it across colour targets.
++typedef struct {
++	GLboolean active, wants_stencil, deleted, depth_ready;
++	unsigned references;
++	GLsizei width, height;
++	SceGxmDepthStencilSurface depthbuffer;
++} renderbuffer;
++
+ // Framebuffer struct
+ typedef struct {
+ 	GLboolean active;
+@@ -600,6 +608,7 @@ typedef struct {
+ 	SceGxmColorSurface colorbuffer;
+ 	SceGxmDepthStencilSurface depthbuffer;
+ 	SceGxmDepthStencilSurface *depthbuffer_ptr;
++	renderbuffer *depth_rb;
+ 	SceGxmTextureFormat format;
+ 	int width;
+ 	int height;
+@@ -615,11 +624,6 @@ typedef struct {
+ 	uint8_t id;
+ } query;
+ 
+-// Renderbuffer struct
+-typedef struct {
+-	GLboolean active;
+-	GLboolean wants_stencil;
+-} renderbuffer;
+ 
+ // Sampler object struct
+ typedef struct {
+@@ -1328,6 +1332,18 @@ static inline __attribute__((always_inline)) uint32_t get_color_from_texture(Sce
+ 	}
+ }
+ 
++// Only private fallback storage belongs to the FBO. Shared RBO storage survives target changes.
++static inline void _vglDiscardPrivateDepth(framebuffer *fb) {
++#ifndef DEPTH_STENCIL_HACK
++	if (fb->depthbuffer_ptr == &fb->depthbuffer) {
++		if (fb->depthbuffer.depthData) mark_as_dirty(fb->depthbuffer.depthData);
++		if (fb->depthbuffer.stencilData) mark_as_dirty(fb->depthbuffer.stencilData);
++	}
++#endif
++	fb->depthbuffer_ptr = NULL;
++	fb->depthbuffer_state &= ~DEPTHBUFFER_READY;
++}
++
+ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(framebuffer *fb, GLenum attachment, texture *tex, GLuint tex_id) {
+ 	// Extracting texture data
+ 	int old_w = fb->width, old_h = fb->height;
+@@ -1362,13 +1378,7 @@ static inline __attribute__((always_inline)) void _glFramebufferTexture2D(frameb
+ 				mark_rt_as_dirty(fb->target);
+ 				fb->target = NULL;
+ 			}
+-			if (fb->depthbuffer_ptr) {
+-#ifndef DEPTH_STENCIL_HACK
+-				mark_as_dirty(fb->depthbuffer_ptr->depthData);
+-#endif
+-				fb->depthbuffer_ptr = NULL;
+-				fb->depthbuffer_state &= ~DEPTHBUFFER_READY;
+-			}
++			_vglDiscardPrivateDepth(fb);
+ 		}
+ 
+ 		// Increasing texture reference counter
+diff --git a/source/textures.c b/source/textures.c
+index 7b5d704..d706d66 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1827,9 +1827,7 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
+ 						if (fb) {
+ 							gpu_free_texture(&texture_slots[i]);
+ 							if (fb->depthbuffer_ptr) {
+-								mark_as_dirty(fb->depthbuffer_ptr->depthData);
+-								fb->depthbuffer_ptr = NULL;
+-								fb->depthbuffer_state = DEPTHBUFFER_MISSING;
++								_vglDiscardPrivateDepth(fb);
+ 							}
+ 							if (fb->target) {
+ 								mark_rt_as_dirty(fb->target);
+diff --git a/source/vgl.c b/source/vgl.c
+index 014e790..0682114 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -206,23 +206,10 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
+ 	sceIoMkdir(vgl_shader_cache_path, 0777);
+ 	sprintf(fname, "%s/v", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
+-	char dirname[256];
+-	sprintf(dirname, "%s/00", fname);
+-	GLboolean skip_creation = sceIoMkdir(dirname, 0777) != 0;
+-	if (!skip_creation) {
+-		for (int i = 1; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
+-	sprintf(fname, "%s/f", vgl_shader_cache_path);
+-	sceIoMkdir(fname, 0777);
+-	if (!skip_creation) {
+-		for (int i = 0; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
++    // Program-cache writes create their bucket lazily. Creating all 512
++    // buckets here stalls a fresh install before the first rendered frame.
++    sprintf(fname, "%s/f", vgl_shader_cache_path);
++    sceIoMkdir(fname, 0777);
+ #endif
+ 	// Check if framebuffer size is valid
+ 	GLboolean res_fallback = GL_FALSE;
