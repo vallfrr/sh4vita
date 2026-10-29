@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="port/livearea/icon0.png" alt="Silent Hill 4: The Room" width="160">
+  <img src="docs/images/banner.png" alt="Silent Hill 4: The Room" width="720">
 </p>
 
 # Silent Hill 4: The Room for PS Vita
