@@ -11,9 +11,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: windows-latest, bin: sh4prep.exe, name: sh4prep-windows.exe }
-          - { os: macos-latest, bin: sh4prep, name: sh4prep-macos }
-          - { os: ubuntu-latest, bin: sh4prep, name: sh4prep-linux }
+          - { os: windows-latest, bin: sh4prep.exe, name: sh4prep-windows.exe, artifact: sh4prep-windows }
+          - { os: macos-latest, bin: sh4prep, name: sh4prep-macos, artifact: sh4prep-macos }
+          - { os: ubuntu-latest, bin: sh4prep, name: sh4prep-linux, artifact: sh4prep-linux }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -26,10 +26,66 @@ jobs:
       - run: cargo test --release
       - run: cargo build --release
       - run: mv target/release/${{ matrix.bin }} ${{ matrix.name }}
+
+      # macOS: a double-clickable .app (zipped), next to the plain command-line binary.
+      - name: Package macOS app
+        if: matrix.os == 'macos-latest'
+        run: |
+          APP=sh4prep.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp sh4prep-macos "$APP/Contents/MacOS/sh4prep"
+          sips -s format icns ../../port/livearea/icon0.png --out "$APP/Contents/Resources/AppIcon.icns"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>sh4prep</string>
+            <key>CFBundleDisplayName</key><string>sh4prep</string>
+            <key>CFBundleIdentifier</key><string>io.github.vallfrr.sh4prep</string>
+            <key>CFBundleExecutable</key><string>sh4prep</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep -s - "$APP"
+          ditto -c -k --keepParent "$APP" sh4prep-macos-app.zip
+
+      # Linux: an AppImage (wraps the same binary; it does not bundle system libraries).
+      - name: Package Linux AppImage
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp sh4prep-linux AppDir/usr/bin/sh4prep
+          cp ../../port/livearea/icon0.png AppDir/sh4prep.png
+          cat > AppDir/sh4prep.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=sh4prep
+          Comment=Prepare the Silent Hill 4 files for the PS Vita port
+          Exec=sh4prep
+          Icon=sh4prep
+          Categories=Utility;
+          Terminal=false
+          DESKTOP
+          printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/usr/bin/sh4prep" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir sh4prep-linux-x86_64.AppImage
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: tools/sh4prep/${{ matrix.name }}
+          name: ${{ matrix.artifact }}
+          path: |
+            tools/sh4prep/${{ matrix.name }}
+            tools/sh4prep/sh4prep-macos-app.zip
+            tools/sh4prep/sh4prep-linux-x86_64.AppImage
+          if-no-files-found: ignore
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
