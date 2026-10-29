@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="port/livearea/icon0.png" alt="Silent Hill 4: The Room" width="160">
+</p>
+
 # Silent Hill 4: The Room for PS Vita
 
 Port of the latest GOG PC version of Silent Hill 4: The Room to the PS Vita.
