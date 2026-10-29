@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/images/banner.png" alt="Silent Hill 4: The Room" width="720">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-white.png">
+    <img src="docs/images/logo-black.png" alt="Silent Hill 4: The Room" width="420">
+  </picture>
 </p>
 
 # Silent Hill 4: The Room for PS Vita
