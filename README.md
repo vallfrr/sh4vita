@@ -27,8 +27,10 @@ Download the VPK and the preparer for your computer:
 |---|---|
 | `sh4vita.vpk` | PS Vita |
 | `sh4prep-windows.exe` | Windows |
-| `sh4prep-linux` | Linux x86-64 |
-| `sh4prep-macos` | macOS |
+| `sh4prep-macos-app.zip` | macOS, Apple Silicon (double-click app) |
+| `sh4prep-macos` | macOS, Apple Silicon (terminal) |
+| `sh4prep-linux-x86_64.AppImage` | Linux x86-64 (double-click) |
+| `sh4prep-linux` | Linux x86-64 (terminal) |
 
 ### Windows
 
@@ -63,12 +65,28 @@ Use the **Windows GOG v5** game files on these systems too. [InnoExtract](https:
    ```
 
    The filename may differ, replace it with the name of your downloaded installer. Keep the quotes around the filename, especially if it contains parentheses. Some GOG installers require an additional RAR extractor: if InnoExtract reports one missing, install `unar` or `unrar` through your package manager and retry. See the [InnoExtract manual](https://constexpr.org/innoextract/innoextract.1).
-4. Download `sh4prep-linux` or `sh4prep-macos` from the release. Open a terminal in the folder containing it and run:
+4. Launch the preparer for your system. It is not signed by Apple or by a Linux distribution, so the first launch needs one extra action.
+
+   **macOS (Apple Silicon), double-click:** download `sh4prep-macos-app.zip`, open it, then double-click `sh4prep`. macOS will say it cannot verify the developer: right-click (or Control-click) the app, choose **Open**, then confirm. If macOS still refuses, open **System Settings > Privacy & Security** and click **Open Anyway**.
+
+   **macOS, terminal:**
 
    ```sh
-   chmod +x sh4prep-linux   # or sh4prep-macos
-   ./sh4prep-linux          # or ./sh4prep-macos
+   chmod +x sh4prep-macos
+   xattr -d com.apple.quarantine sh4prep-macos
+   ./sh4prep-macos
    ```
+
+   **Linux, double-click:** download `sh4prep-linux-x86_64.AppImage`, allow it to run (right-click > Properties > Permissions > **Allow executing as program**, or `chmod +x sh4prep-linux-x86_64.AppImage`), then double-click it.
+
+   **Linux, terminal:**
+
+   ```sh
+   chmod +x sh4prep-linux
+   ./sh4prep-linux
+   ```
+
+   If the window does not open on Linux, install the display libraries (on Ubuntu/Debian: `sudo apt install libxkbcommon0 libwayland-client0`).
 
 5. In the preparer, select the folder containing `SILENT HILL 4.exe` alongside `data/`, `demo/`, `movie/` and `sound/`. After InnoExtract, this may be `sh4-extracted/app/`; use whichever folder directly contains these files and directories.
 6. Choose a separate output folder and your language, then press **Prepare the files**. Continue with [Copy to the Vita](#copy-to-the-vita).
