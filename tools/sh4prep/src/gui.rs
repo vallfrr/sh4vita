@@ -4,10 +4,11 @@ use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const BACKGROUND: Color32 = Color32::from_rgb(19, 23, 23);
-const CARD: Color32 = Color32::from_rgb(28, 34, 33);
-const ACCENT: Color32 = Color32::from_rgb(164, 190, 158);
-const MUTED: Color32 = Color32::from_rgb(158, 169, 163);
+const BACKGROUND: Color32 = Color32::from_rgb(14, 14, 14);
+const CARD: Color32 = Color32::from_rgb(26, 26, 26);
+const ACCENT: Color32 = Color32::from_rgb(238, 238, 238);
+const MUTED: Color32 = Color32::from_rgb(140, 140, 140);
+const LINE: Color32 = Color32::from_rgb(58, 58, 58);
 
 #[derive(Default)]
 enum Phase {
@@ -52,13 +53,16 @@ pub fn run() {
         let mut style = (*cc.egui_ctx.style_of(egui::Theme::Dark)).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BACKGROUND;
-        style.visuals.extreme_bg_color = Color32::from_rgb(13, 17, 16);
-        style.visuals.override_text_color = Some(Color32::from_rgb(230, 234, 229));
-        style.visuals.selection.bg_fill = Color32::from_rgb(63, 86, 65);
+        style.visuals.extreme_bg_color = Color32::from_rgb(8, 8, 8);
+        style.visuals.override_text_color = Some(Color32::from_rgb(232, 232, 232));
+        style.visuals.selection.bg_fill = Color32::from_rgb(85, 85, 85);
         style.visuals.widgets.inactive.bg_fill = CARD;
         style.visuals.widgets.inactive.weak_bg_fill = CARD;
-        style.visuals.widgets.inactive.corner_radius = 6.into();
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(49, 61, 53);
+        style.visuals.widgets.inactive.corner_radius = 4.into();
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 44, 44);
+        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(44, 44, 44);
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, MUTED);
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
@@ -75,7 +79,7 @@ fn folder(ui: &mut egui::Ui, id: &str, label: &str, hint: &str, browse: &str, va
         let width = (ui.available_width() - 124.0).max(140.0);
         ui.add_sized([width, 30.0], egui::TextEdit::singleline(value).id_salt(id).margin(egui::vec2(8.0, 6.0)));
         if ui.add_sized([116.0, 30.0], egui::Button::new(browse)
-            .fill(BACKGROUND).stroke(egui::Stroke::new(1.0, Color32::from_rgb(65, 78, 68)))).clicked() {
+            .fill(BACKGROUND).stroke(egui::Stroke::new(1.0, LINE))).clicked() {
             if let Some(path) = rfd::FileDialog::new().set_title(label).pick_folder() {
                 *value = path.display().to_string();
             }
@@ -104,7 +108,7 @@ impl App {
                 })
             });
             st.lock().unwrap().phase = match res {
-                Ok(dir) => Phase::Complete(dir),
+                Ok(dir) => { open_folder(dir.parent().unwrap_or(&dir)); Phase::Complete(dir) }
                 Err(error) => Phase::Failed(error),
             };
             ctx.request_repaint();
@@ -138,7 +142,7 @@ impl eframe::App for App {
                 let text = &i18n::TEXT[self.lang];
                 ui.label(RichText::new(text.language_hint).size(12.0).color(MUTED));
                 ui.add_space(10.0);
-                egui::Frame::new().fill(CARD).corner_radius(10).inner_margin(14).show(ui, |ui| {
+                egui::Frame::new().fill(CARD).stroke(egui::Stroke::new(1.0, LINE)).corner_radius(6).inner_margin(14).show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| {
                         folder(ui, "game", text.game, text.game_hint, text.browse, &mut self.game);
                         ui.add_space(9.0);
@@ -168,7 +172,7 @@ impl eframe::App for App {
                         ui.add(egui::Label::new(dir.display().to_string()).wrap());
                     }
                     Phase::Failed(error) => {
-                        ui.label(RichText::new(text.failed).strong().color(Color32::from_rgb(231, 161, 145)));
+                        ui.label(RichText::new(text.failed).strong().color(ACCENT));
                         ui.add(egui::Label::new(text.error(error)).wrap());
                     }
                 }
@@ -179,4 +183,10 @@ impl eframe::App for App {
         });
         if busy { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
     }
+}
+
+/// Shows the destination folder (the one that contains `sh4`) in the system file manager.
+fn open_folder(path: &std::path::Path) {
+    let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener).arg(path).spawn();
 }
