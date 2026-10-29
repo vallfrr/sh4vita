@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-white.png">
-    <img src="docs/images/logo-black.png" alt="Silent Hill 4: The Room" width="420">
+    <img src="docs/images/logo-black.png" alt="Silent Hill 4: The Room" width="100%">
   </picture>
 </p>
 
