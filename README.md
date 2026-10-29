@@ -1,7 +1,9 @@
 # Silent Hill 4: The Room for PS Vita
 
 Port of the latest GOG PC version of Silent Hill 4: The Room to the PS Vita.
-Your may use your own copy of the game.
+You may use your own copy of the game.
+
+**[Download the latest release](../../releases/latest)**: the VPK for the PS Vita and the data preparer for Windows, macOS and Linux.
 
 ## What you need
 
@@ -18,8 +20,8 @@ Download the VPK and the preparer for your computer:
 |---|---|
 | `sh4vita.vpk` | PS Vita |
 | `sh4prep-windows.exe` | Windows |
-| `sh4prep-linux-x86_64.tar.gz` | Linux x86-64 |
-| `sh4prep-macos-arm64.zip` | macOS |
+| `sh4prep-linux` | Linux x86-64 |
+| `sh4prep-macos` | macOS |
 
 ### Windows
 
@@ -54,11 +56,11 @@ Use the **Windows GOG v5** game files on these systems too. [InnoExtract](https:
    ```
 
    The filename may differ, replace it with the name of your downloaded installer. Keep the quotes around the filename, especially if it contains parentheses. Some GOG installers require an additional RAR extractor: if InnoExtract reports one missing, install `unar` or `unrar` through your package manager and retry. See the [InnoExtract manual](https://constexpr.org/innoextract/innoextract.1).
-4. Extract the `sh4prep` archive for your system. Open a terminal in the extracted preparer folder and run:
+4. Download `sh4prep-linux` or `sh4prep-macos` from the release. Open a terminal in the folder containing it and run:
 
    ```sh
-   chmod +x sh4prep
-   ./sh4prep
+   chmod +x sh4prep-linux   # or sh4prep-macos
+   ./sh4prep-linux          # or ./sh4prep-macos
    ```
 
 5. In the preparer, select the folder containing `SILENT HILL 4.exe` alongside `data/`, `demo/`, `movie/` and `sound/`. After InnoExtract, this may be `sh4-extracted/app/`; use whichever folder directly contains these files and directories.
