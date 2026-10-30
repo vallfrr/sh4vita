@@ -32,7 +32,7 @@ void nat_sound_request3d(CPU *c) { sound_archive_trace(c,0x409a30); F_00409a30_o
 extern void F_00551f80_orig(CPU *c);
 void nat_arena_init(CPU *c) {
     const char *setting = getenv("SH4_ARENA_MB");
-    unsigned mib = setting ? (unsigned)atoi(setting) : 64;
+    unsigned mib = setting ? (unsigned)atoi(setting) : 56;   // 56: measured peak 47.5 MiB over 386 rooms; SH4_ARENA_MB=64 restores the original reservation
     if (mib < 32 || mib >= 64) { F_00551f80_orig(c); return; }
     HOSTFN;
     uint32_t bytes = mib << 20;

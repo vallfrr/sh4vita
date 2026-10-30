@@ -26,6 +26,37 @@ static void log_heap_block(void *ptr, size_t bytes, int used, void *arg) {
                (unsigned long long)bytes, used);
 }
 
+#ifdef SH4_ALLOC_PROF
+// Diagnostic only: live guest-heap blocks grouped by exact size, logged with the host profiler report (compare two reports to see what accumulates).
+typedef struct { size_t size; unsigned n; } SizeCount;
+static SizeCount g_hist[1024];
+static unsigned g_hist_n, g_hist_overflow;
+static void hist_block(void *ptr, size_t bytes, int used, void *arg) {
+    (void)ptr; (void)arg;
+    if (!used) return;
+    for (unsigned i = 0; i < g_hist_n; i++) if (g_hist[i].size == bytes) { g_hist[i].n++; return; }
+    if (g_hist_n < 1024) g_hist[g_hist_n++] = (SizeCount){bytes, 1};
+    else g_hist_overflow++;
+}
+void gheap_report(void) {
+    if (!g_heap_lock) return;
+    SDL_LockMutex(g_heap_lock);
+    g_hist_n = 0; g_hist_overflow = 0;
+    tlsf_walk_pool(tlsf_get_pool(g_tlsf), hist_block, NULL);
+    SDL_UnlockMutex(g_heap_lock);
+    unsigned long long total = 0, blocks = 0;
+    for (unsigned i = 0; i < g_hist_n; i++) { total += (unsigned long long)g_hist[i].size * g_hist[i].n; blocks += g_hist[i].n; }
+    rt_log("[gheap] live %llu KB in %llu blocks, %u distinct sizes (+%u uncounted)\n", total >> 10, blocks, g_hist_n, g_hist_overflow);
+    for (int k = 0; k < 18; k++) {
+        unsigned best = 0; unsigned long long bb = 0;
+        for (unsigned i = 0; i < g_hist_n; i++) { unsigned long long v = (unsigned long long)g_hist[i].size * g_hist[i].n; if (v > bb) { bb = v; best = i; } }
+        if (!bb) break;
+        rt_log("[gheap] size=%llu n=%u total=%llu KB\n", (unsigned long long)g_hist[best].size, g_hist[best].n, bb >> 10);
+        g_hist[best].n = 0;
+    }
+}
+#endif
+
 void gheap_init(uint32_t base, uint32_t size) {
     g_tlsf = tlsf_create_with_pool(g_mem + base, size);
     g_heap_lock = SDL_CreateMutex();

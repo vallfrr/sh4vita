@@ -63,9 +63,10 @@ void q_win(uint32_t *wall, uint32_t *idle) { *wall = NOW(); *idle = st_idle; }  
 // Records are written into the ring without publishing anything; `flush` publishes `head` (and wakes the render thread) every
 // FLUSH words, at every sync and at every present: little cache-line traffic between the two cores.
 static void flush(void) {
-    if (whead == head) return;
+    unsigned w = whead;
+    if (w == head) return;
     __sync_synchronize();
-    head = whead;
+    if ((int)(w - head) > 0) head = w;   // several producer threads: never move head backwards
     __sync_synchronize();
     if (c_sleep && __sync_lock_test_and_set(&c_sleep, 0)) sceKernelSignalSema(c_sema, 1);
 }
@@ -99,6 +100,7 @@ static uint32_t *rec_begin(unsigned op, unsigned nw) {   // nw = words of the re
     }
 }
 static void rec_commit(unsigned nw) {
+    __sync_synchronize();   // the record words must be visible before another thread (flush in q_sync_n) can publish them
     whead += nw;
     prod_owner = 0; __sync_synchronize(); prod_lock = 0;
     st_recs++;
@@ -134,12 +136,17 @@ void q_sync_n(const char *why) {
     if (!why_t[i].n) why_t[i].n = why;
     why_t[i].c++;
     flush();
-    if (tail == whead && !fb_pending) return;
+    if (tail == whead && !fb_pending) { dbg_why = NULL; return; }
     uint32_t t0 = NOW();
     sync_req = 1;   // the render thread runs what it set aside (the frame will not be interpolated)
     __sync_synchronize();
     if (c_sleep && __sync_lock_test_and_set(&c_sleep, 0)) sceKernelSignalSema(c_sema, 1);
-    while (tail != whead || fb_pending) __asm__ volatile("yield");
+    while (tail != whead || fb_pending) {
+        // Another guest thread may have committed records after our flush: nobody publishes them while we wait here, and the render thread sleeps (hang seen at 78 min).
+        if (whead != head) flush();
+        else if (c_sleep) { sync_req = 1; __sync_synchronize(); if (c_sleep && __sync_lock_test_and_set(&c_sleep, 0)) sceKernelSignalSema(c_sema, 1); }
+        __asm__ volatile("yield");
+    }
     st_sync += NOW() - t0;
     dbg_why = NULL;
 }
@@ -460,6 +467,8 @@ static void frame_end(void) {
 void q_dump_stall(void) {
     static unsigned last;
     if (st_recs != last) { last = st_recs; return; }
+    // Rescue: records committed by a thread that then stopped submitting (or waits on a lock) are never published; publish them from the watchdog.
+    if (whead != head) { unsigned n = whead - head; flush(); rt_log("[stall] rescue: published %u words (producer lock=%d owner=%u sync owner=%u)\n", n, (int)prod_lock, (unsigned)prod_owner, (unsigned)g_owner); }
     rt_log("[stall] tail=%u whead=%u head=%u fb_pending=%d sync_req=%d c_sleep=%d fb_n=%u f_direct=%d render op=%u at %u, game in sync '%s' recs=%u\n",
            tail, whead, head, (int)fb_pending, (int)sync_req, (int)c_sleep, (unsigned)fb_n, (int)f_direct, dbg_rop, dbg_rt,
            dbg_why ? dbg_why : "-", st_recs);

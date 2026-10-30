@@ -182,6 +182,9 @@ M(dev, GetDeviceState) {
     uint32_t n = ARG(2), p = ARG(3);
     memset(mb + p, 0, n);
     SDL_PumpEvents();
+#ifdef __vita__
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);   // nothing reads the SDL event queue: unread events (touch, sticks, sensors) pile up in the host heap
+#endif
     if (input_gate(self, mb, p, n)) STDRET(3, HR_OK);
     if (self->type == 0) {
         int nk;

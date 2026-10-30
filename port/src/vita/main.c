@@ -72,6 +72,9 @@ void plat_gl_swap(void) {
           q_sync("shot"); plat_shot_raw(path);
           rt_log("[auto] %u = swap %u\n", k, g_swap_n + 1);
       } }
+#ifdef SH4_ALLOC_PROF
+    { extern void allocprof_report(void); static unsigned ap; if (ap++ % 1800 == 0) allocprof_report(); }
+#endif
     static unsigned n;
     if (n++ % 150 == 0) {
         struct mallinfo mi = mallinfo();
